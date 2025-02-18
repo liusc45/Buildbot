@@ -1,0 +1,161 @@
+---
+- name: Deploy Buildbot and Configure Nginx Reverse Proxy with Certbot
+  hosts: all
+  become: true
+  vars:
+    vps_ip: "123.123.123.123"         # Replace with your VPS IP
+    domain_name: "build.poecdn.cloud"   # Replace with your domain if needed
+    buildbot_master_dir: "/home/buildbot/master"
+    buildbot_worker_dir: "/home/buildbot/worker"
+  tasks:
+    - name: Update package cache (Debian)
+      apt:
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Update package cache (RedHat/CentOS)
+      yum:
+        update_cache: yes
+      when: ansible_os_family == "RedHat"
+
+    - name: Install required packages (Debian)
+      apt:
+        name:
+          - python3
+          - python3-pip
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+          - ufw
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Install required packages (CentOS)
+      yum:
+        name:
+          - python3
+          - python3-pip
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Allow port 8010 through UFW (Debian)
+      ufw:
+        rule: allow
+        port: 8010
+        proto: tcp
+      when: ansible_os_family == "Debian"
+
+    - name: Install Buildbot using pip3
+      pip:
+        name: "buildbot[bundle]"
+        executable: pip3
+
+    - name: Create Buildbot master directory
+      file:
+        path: "{{ buildbot_master_dir }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Create Buildbot master instance
+      command: buildbot create-master {{ buildbot_master_dir }}
+      args:
+        creates: "{{ buildbot_master_dir }}/master.cfg.sample"
+
+    - name: Copy master.cfg.sample to master.cfg
+      copy:
+        src: "{{ buildbot_master_dir }}/master.cfg.sample"
+        dest: "{{ buildbot_master_dir }}/master.cfg"
+        remote_src: yes
+
+    - name: Set buildbotURL in master.cfg with VPS IP
+      lineinfile:
+        path: "{{ buildbot_master_dir }}/master.cfg"
+        regexp: '^(c\[\s*\'buildbotURL\'\s*\]\s*=\s*").*(")'
+        line: 'c[\'buildbotURL\'] = "http://{{ vps_ip }}:8010/"'
+        backrefs: yes
+
+    - name: Start Buildbot master
+      command: buildbot start {{ buildbot_master_dir }}
+
+    - name: Create Buildbot worker directory
+      file:
+        path: "{{ buildbot_worker_dir }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Create Buildbot worker instance
+      command: buildbot-worker create-worker {{ buildbot_worker_dir }} localhost example-worker pass
+      args:
+        creates: "{{ buildbot_worker_dir }}/info/admin"
+
+    - name: Update worker host file with VPS IP
+      copy:
+        content: "{{ vps_ip }}"
+        dest: "{{ buildbot_worker_dir }}/info/host"
+        force: yes
+
+    - name: Start Buildbot worker
+      command: buildbot-worker start {{ buildbot_worker_dir }}
+
+    - name: Create Nginx site configuration for Buildbot
+      copy:
+        dest: "/etc/nginx/sites-available/{{ domain_name }}"
+        content: |
+          server {
+              listen 80;
+              server_name {{ domain_name }};
+              # Redirect all HTTP requests to HTTPS
+              return 301 https://$host$request_uri;
+          }
+          
+          server {
+              listen 443 ssl;
+              server_name {{ domain_name }};
+          
+              ssl_certificate /etc/letsencrypt/live/{{ domain_name }}/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/{{ domain_name }}/privkey.pem;
+              ssl_protocols TLSv1.2 TLSv1.3;
+              ssl_ciphers HIGH:!aNULL:!MD5;
+          
+              location / {
+                  proxy_pass http://127.0.0.1:8010;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+              }
+          }
+      notify: Reload Nginx
+
+    - name: Enable Nginx site
+      file:
+        src: "/etc/nginx/sites-available/{{ domain_name }}"
+        dest: "/etc/nginx/sites-enabled/{{ domain_name }}"
+        state: link
+
+    - name: Test Nginx configuration
+      command: nginx -t
+
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: Obtain SSL certificate with Certbot
+      command: certbot --nginx -d {{ domain_name }}
+      register: certbot_output
+      ignore_errors: yes
+
+  handlers:
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
